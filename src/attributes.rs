@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
+use quote::ToTokens;
 use syn::parse::ParseStream;
-use syn::{Attribute, Error, Meta, Path, PathSegment, TypePath};
+use syn::{Attribute, Error, Meta, Path, PathSegment, Token, TypePath};
 
 struct CallMethodAttribute {
     name: syn::Ident,
@@ -83,6 +84,61 @@ impl syn::parse::Parse for AssociatedConstant {
     }
 }
 
+pub struct ExprPlaceHolder;
+impl syn::parse::Parse for ExprPlaceHolder {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        syn::custom_keyword!(expr);
+
+        input.parse::<Token![$]>()?;
+        input.parse::<expr>()?;
+        Ok(Self)
+    }
+}
+
+enum TemplateToken {
+    Normal(proc_macro2::TokenTree),
+    Placeholder(ExprPlaceHolder),
+}
+
+pub struct TemplateExpr {
+    tokens: Vec<TemplateToken>,
+}
+
+impl syn::parse::Parse for TemplateExpr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut tokens = vec![];
+
+        while !input.is_empty() {
+            if input.fork().parse::<ExprPlaceHolder>().is_ok() {
+                let placeholder = input.parse::<ExprPlaceHolder>()?;
+                tokens.push(TemplateToken::Placeholder(placeholder));
+                continue;
+            }
+
+            let tt: proc_macro2::TokenTree = input.parse()?;
+            tokens.push(TemplateToken::Normal(tt));
+        }
+
+        Ok(TemplateExpr { tokens })
+    }
+}
+
+impl TemplateExpr {
+    pub fn to_replaced(&self, replacement: &syn::Expr) -> syn::Result<syn::Expr> {
+        let mut stream = proc_macro2::TokenStream::new();
+        for token in &self.tokens {
+            match token {
+                TemplateToken::Normal(tt) => stream.extend(Some(tt.clone())),
+                TemplateToken::Placeholder(_) => {
+                    stream.extend(replacement.to_token_stream());
+                }
+            }
+        }
+
+        syn::parse2(stream)
+    }
+}
+
 pub struct TraitTarget {
     type_path: TypePath,
 }
@@ -113,6 +169,7 @@ enum ParsedAttribute {
     TargetMethod(syn::Ident),
     ThroughTrait(TraitTarget),
     ConstantAccess(AssociatedConstant),
+    Expr(TemplateExpr),
 }
 
 fn parse_attributes(
@@ -182,6 +239,11 @@ fn parse_attributes(
                             .parse_args::<AssociatedConstant>()
                             .expect("Cannot parse `const` attribute"),
                     )),
+                    "expr" => Some(ParsedAttribute::Expr(
+                        attribute
+                            .parse_args::<TemplateExpr>()
+                            .expect("Cannot parse `expr` attribute"),
+                    )),
                     _ => None,
                 }
             } else {
@@ -204,6 +266,7 @@ pub struct MethodAttributes<'a> {
     pub generate_await: Option<bool>,
     pub target_trait: Option<TypePath>,
     pub associated_constant: Option<AssociatedConstant>,
+    pub expr_attr: Option<TemplateExpr>,
 }
 
 /// Iterates through the attributes of a method and filters special attributes.
@@ -223,6 +286,7 @@ pub fn parse_method_attributes<'a>(
     let mut generate_await: Option<bool> = None;
     let mut target_trait: Option<TraitTarget> = None;
     let mut associated_constant: Option<AssociatedConstant> = None;
+    let mut expr_attr: Option<TemplateExpr> = None;
 
     let (parsed, other) = parse_attributes(attrs);
     for attr in parsed {
@@ -264,6 +328,15 @@ pub fn parse_method_attributes<'a>(
                 }
                 associated_constant = Some(const_attr);
             }
+            ParsedAttribute::Expr(token_tree) => {
+                if expr_attr.is_some() {
+                    panic!(
+                        "Multiple const attributes specified for {}",
+                        method.sig.ident
+                    )
+                }
+                expr_attr = Some(token_tree);
+            }
         }
     }
 
@@ -278,6 +351,7 @@ pub fn parse_method_attributes<'a>(
         expressions: expressions.into(),
         target_trait: target_trait.map(|t| t.type_path),
         associated_constant,
+        expr_attr,
     }
 }
 
@@ -315,6 +389,9 @@ pub fn parse_segment_attributes(attrs: &[Attribute]) -> SegmentAttributes {
             }
             ParsedAttribute::ConstantAccess(_) => {
                 panic!("Const attribute cannot be specified on a `to <expr>` segment.");
+            }
+            ParsedAttribute::Expr(_) => {
+                panic!("Expr attribute cannot be specified on a `to <expr>` segment.");
             }
         }
     }

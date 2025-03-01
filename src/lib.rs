@@ -880,6 +880,7 @@ pub fn delegate(tokens: TokenStream) -> TokenStream {
 
             let is_method = method.method.sig.receiver().is_some();
             let associated_const = &attributes.associated_constant;
+            let expr_attr = &attributes.expr_attr;
 
             // Use the body of a closure (like `|k: u32| <body>`) as the delegation expression
             let delegated_body = if let Expr::Closure(closure) = delegated_expr {
@@ -941,6 +942,11 @@ pub fn delegate(tokens: TokenStream) -> TokenStream {
                         }
                         get_const(#expr)
                     }}
+                } else if let Some(expr_attr) = expr_attr {
+                    match expr_attr.to_replaced(expr) {
+                        Ok(replaced) => quote::quote! { #replaced },
+                        Err(err) => syn::Error::into_compile_error(err),
+                    }
                 } else if is_method {
                     quote::quote! { #expr.#name#generics(#(#args),*) }
                 } else {
